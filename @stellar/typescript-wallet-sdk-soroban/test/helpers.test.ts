@@ -553,3 +553,71 @@ describe("getInvocationDetails for a Soroban Authorized Invocation tree", () => 
     expect(subDetail4.asset).toBeUndefined();
   });
 });
+
+describe("XDR integer boundary values (Protocol 26 strict validation)", () => {
+  it("should handle i32 min and max boundary values", () => {
+    const i32Min = xdr.ScVal.scvI32(-2147483648);
+    expect(scValByType(i32Min)).toEqual("-2147483648");
+
+    const i32Max = xdr.ScVal.scvI32(2147483647);
+    expect(scValByType(i32Max)).toEqual("2147483647");
+  });
+
+  it("should handle u32 max boundary value", () => {
+    const u32Max = xdr.ScVal.scvU32(4294967295);
+    expect(scValByType(u32Max)).toEqual("4294967295");
+  });
+
+  it("should handle u32 zero value", () => {
+    const u32Zero = xdr.ScVal.scvU32(0);
+    expect(scValByType(u32Zero)).toEqual("0");
+  });
+
+  it("should handle i64 min and max boundary values", () => {
+    const i64Max = xdr.ScVal.scvI64(
+      xdr.Int64.fromString("9223372036854775807"),
+    );
+    const parsedMax = scValByType(i64Max);
+    expect(parsedMax).toEqual("9223372036854775807");
+
+    const i64Min = xdr.ScVal.scvI64(
+      xdr.Int64.fromString("-9223372036854775808"),
+    );
+    const parsedMin = scValByType(i64Min);
+    expect(parsedMin).toEqual("-9223372036854775808");
+  });
+
+  it("should handle u64 max boundary value", () => {
+    const u64Max = xdr.ScVal.scvU64(
+      xdr.Uint64.fromString("18446744073709551615"),
+    );
+    const parsed = scValByType(u64Max);
+    expect(parsed).toEqual("18446744073709551615");
+  });
+
+  it("should throw on i64 overflow", () => {
+    expect(() => xdr.Int64.fromString("9223372036854775808")).toThrow();
+  });
+
+  it("should throw on i64 underflow", () => {
+    expect(() => xdr.Int64.fromString("-9223372036854775809")).toThrow();
+  });
+
+  it("should throw on u64 overflow", () => {
+    expect(() => xdr.Uint64.fromString("18446744073709551616")).toThrow();
+  });
+
+  it("should throw on u64 negative value", () => {
+    expect(() => xdr.Uint64.fromString("-1")).toThrow();
+  });
+
+  it("should throw on i32 overflow at serialization", () => {
+    const val = xdr.ScVal.scvI32(2147483648);
+    expect(() => val.toXDR()).toThrow("XDR Write Error");
+  });
+
+  it("should throw on u32 overflow at serialization", () => {
+    const val = xdr.ScVal.scvU32(4294967296);
+    expect(() => val.toXDR()).toThrow("XDR Write Error");
+  });
+});

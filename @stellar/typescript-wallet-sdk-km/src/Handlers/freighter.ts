@@ -18,29 +18,42 @@ export const freighterHandler: KeyTypeHandler = {
 
     if (key.privateKey !== "") {
       throw new Error(
-        `Non-ledger key sent to ledger handler: ${JSON.stringify(
-          key.publicKey,
-        )}`,
+        `Non-Freighter key sent to Freighter handler: ${key.publicKey}`,
       );
     }
 
+    const networkPassphrase =
+      (custom && custom.networkPassphrase) || key.network || Networks.PUBLIC;
+
     try {
-      const response = await freighterApi.signTransaction(
-        transaction.toXDR(),
-        custom && custom.network ? custom.network : undefined,
-      );
+      const response = await freighterApi.signTransaction(transaction.toXDR(), {
+        networkPassphrase,
+        address: custom && custom.address ? custom.address : undefined,
+      });
+
+      if (response.error) {
+        const { message, code } = response.error;
+        throw new Error(
+          message
+            ? `Freighter signTransaction failed: ${message} (code ${code})`
+            : `Freighter signTransaction failed with code ${code}`,
+        );
+      }
 
       // fromXDR() returns type "Transaction | FeeBumpTransaction" and
       // signTransaction() doesn't like "| FeeBumpTransaction" type, so casting
       // to "Transaction" type.
       return TransactionBuilder.fromXDR(
-        response,
-        Networks.PUBLIC,
+        response.signedTxXdr,
+        networkPassphrase,
       ) as Transaction;
     } catch (error) {
-      const errorMsg = error.toString();
+      if (error instanceof Error) {
+        throw error;
+      }
+      const errorMsg = String(error);
       throw new Error(
-        `We couldn’t sign the transaction with Freighter. ${errorMsg}.`,
+        `We couldn't sign the transaction with Freighter. ${errorMsg}.`,
       );
     }
   },
