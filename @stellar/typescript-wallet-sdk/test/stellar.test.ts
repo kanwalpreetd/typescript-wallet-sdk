@@ -1,5 +1,12 @@
-import { Keypair, Memo, MemoText, Horizon } from "@stellar/stellar-sdk";
+import {
+  Keypair,
+  Memo,
+  MemoText,
+  Horizon,
+  Transaction,
+} from "@stellar/stellar-sdk";
 import axios from "axios";
+import sinon from "sinon";
 
 import { Stellar, Wallet } from "../src";
 import {
@@ -14,6 +21,7 @@ import {
 } from "../src/walletSdk/Asset";
 import { TransactionStatus, WithdrawTransaction } from "../src/walletSdk/Types";
 import {
+  TransactionSubmitWithFeeIncreaseFailedError,
   WithdrawalTxMissingDestinationError,
   WithdrawalTxMissingMemoError,
   WithdrawalTxNotPendingUserTransferStartError,
@@ -158,6 +166,51 @@ describe("Stellar", () => {
     expect(txn.fee).toBe("200");
   });
 
+  it("should enforce maxFee across multiple submitWithFeeIncrease retries", async () => {
+    const txTooLateRejection = {
+      response: {
+        status: 400,
+        statusText: "Bad Request",
+        data: {
+          extras: {
+            result_codes: { transaction: "tx_too_late" },
+          },
+        },
+      },
+    };
+
+    // Always reject with tx_too_late so the fee climbs on every retry. With the
+    // fix the maxFee cap is honored across all retries and submitWithFeeIncrease
+    // eventually throws; without it the cap is dropped after the first retry and
+    // the recursion never stops. Restore the spy in a finally block: a leaked
+    // mock on submitTransaction would turn the next test's real submission into
+    // a no-op.
+    const submitStub = jest
+      .spyOn(stellar, "submitTransaction")
+      .mockRejectedValue(txTooLateRejection);
+
+    const buildingFunction = (builder) =>
+      builder.transfer(kp.publicKey, new NativeAssetId(), "2");
+
+    try {
+      await expect(
+        stellar.submitWithFeeIncrease({
+          sourceAddress: kp,
+          timeout: 180,
+          baseFeeIncrease: 100,
+          buildingFunction,
+          baseFee: 100,
+          maxFee: 250,
+        }),
+      ).rejects.toThrow(TransactionSubmitWithFeeIncreaseFailedError);
+      // The cap is enforced only after several retries, proving it survives
+      // past the first retry (the bug being fixed).
+      expect(submitStub.mock.calls.length).toBeGreaterThan(1);
+    } finally {
+      submitStub.mockRestore();
+    }
+  });
+
   it("should add and remove asset support", async () => {
     const asset = new IssuedAssetId(
       "USDC",
@@ -200,6 +253,74 @@ describe("Stellar", () => {
   it("should return recommended fee", async () => {
     const fee = await stellar.getRecommendedFee();
     expect(fee).toBeTruthy();
+  });
+
+  describe("submitTransaction 504 handling", () => {
+    let clock: sinon.SinonFakeTimers;
+    let randomStub: sinon.SinonStub;
+
+    beforeEach(() => {
+      clock = sinon.useFakeTimers();
+      // Zero jitter for deterministic test timing.
+      randomStub = sinon.stub(Math, "random").returns(0);
+    });
+
+    afterEach(() => {
+      clock.restore();
+      randomStub.restore();
+      jest.restoreAllMocks();
+    });
+
+    const make504 = () => ({ response: { status: 504 } });
+
+    it("retries once on 504 then returns on success", async () => {
+      const serverStub = jest
+        .spyOn(stellar.server, "submitTransaction")
+        .mockRejectedValueOnce(make504())
+        .mockResolvedValueOnce({ successful: true } as any);
+
+      const tx = {} as Transaction;
+      const promise = stellar.submitTransaction(tx);
+
+      // Equal-jitter sleep at attempt 0 with Math.random stubbed to 0 is
+      // cappedDelay/2 = 1000/2 = 500ms.
+      await clock.tickAsync(500);
+
+      await expect(promise).resolves.toBe(true);
+      expect(serverStub).toHaveBeenCalledTimes(2);
+    });
+
+    it("rethrows immediately on a non-504 error", async () => {
+      const serverStub = jest
+        .spyOn(stellar.server, "submitTransaction")
+        .mockRejectedValueOnce({ response: { status: 500 } });
+
+      await expect(
+        stellar.submitTransaction({} as Transaction),
+      ).rejects.toMatchObject({ response: { status: 500 } });
+      expect(serverStub).toHaveBeenCalledTimes(1);
+    });
+
+    it("gives up after the bounded number of retries and rethrows the last 504", async () => {
+      // SUBMIT_504_MAX_RETRIES = 5 → 1 initial + 5 retries = 6 total attempts.
+      const serverStub = jest
+        .spyOn(stellar.server, "submitTransaction")
+        .mockRejectedValue(make504());
+
+      const promise = stellar.submitTransaction({} as Transaction);
+      // Surface the rejection eagerly so an unhandled rejection doesn't crash
+      // the test runner mid-tick.
+      promise.catch(() => undefined);
+
+      // Sum of equal-jitter sleeps (cappedDelay/2) with Math.random stubbed
+      // to 0: 500 + 1000 + 2000 + 4000 + 8000 = 15500ms.
+      await clock.tickAsync(15500);
+
+      await expect(promise).rejects.toMatchObject({
+        response: { status: 504 },
+      });
+      expect(serverStub).toHaveBeenCalledTimes(6);
+    });
   });
 
   describe("TransactionBuilder/transferWithdrawalTransaction", () => {

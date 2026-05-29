@@ -24,6 +24,13 @@ import {
 import { getResultCode } from "../Utils/getResultCode";
 import { SigningKeypair } from "./Account";
 
+const SUBMIT_504_MAX_RETRIES = 5;
+const SUBMIT_504_BASE_DELAY_MS = 1000;
+const SUBMIT_504_MAX_DELAY_MS = 30000;
+
+const sleep = (ms: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 /**
  * Interaction with the Stellar Network.
  * Do not create this object directly, use the Wallet class.
@@ -118,30 +125,58 @@ export class Stellar {
   }
 
   /**
-   * Submits a signed transaction to the server. If the submission fails with status
-   * 504 indicating a timeout error, it will automatically retry.
+   * Submits a signed transaction to Horizon.
+   *
+   * On HTTP 504 (timeout), retries with exponential backoff up to
+   * {@link SUBMIT_504_MAX_RETRIES} times. Any non-504 error is rethrown
+   * immediately without retrying.
+   *
    * @param {Transaction|FeeBumpTransaction} signedTransaction - The signed transaction to submit.
-   * @returns {boolean} `true` if the transaction was successfully submitted.
-   * @throws {TransactionSubmitFailedError} If the transaction submission fails.
+   * @returns {boolean} `true` if Horizon confirmed the submission as successful.
+   * @throws {TransactionSubmitFailedError} If Horizon responded with a non-successful
+   *   submission result (the transaction reached Horizon but was rejected).
+   * @throws The underlying 504 error if every retry attempt timed out. In this
+   *   case the transaction's on-chain status is **indeterminate** — Horizon may
+   *   have ingested it on the final attempt without responding in time. Callers
+   *   should poll the transaction hash to determine the actual outcome rather
+   *   than resubmit blindly; resubmitting a signed transaction with the same
+   *   sequence number will fail with `tx_bad_seq` once the original lands.
    */
   async submitTransaction(
     signedTransaction: Transaction | FeeBumpTransaction,
   ): Promise<boolean> {
-    try {
-      const response = await this.server.submitTransaction(signedTransaction);
-      if (!response.successful) {
-        throw new TransactionSubmitFailedError(response);
-      }
-      return true;
-    } catch (e) {
-      if (e.response.status === 504) {
-        // in case of 504, keep retrying this tx until submission succeeds or we get a different error
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= SUBMIT_504_MAX_RETRIES; attempt++) {
+      try {
+        const response = await this.server.submitTransaction(signedTransaction);
+        if (!response.successful) {
+          throw new TransactionSubmitFailedError(response);
+        }
+        return true;
+      } catch (e) {
+        if (e?.response?.status !== 504) {
+          throw e;
+        }
+        lastError = e;
+        if (attempt === SUBMIT_504_MAX_RETRIES) {
+          break;
+        }
         // https://developers.stellar.org/api/errors/http-status-codes/horizon-specific/timeout
         // https://developers.stellar.org/docs/encyclopedia/error-handling#timeouts
-        return await this.submitTransaction(signedTransaction);
+        // Equal-jitter backoff: each attempt waits at least half the capped
+        // exponential delay (a deterministic, progressive floor) plus a random
+        // amount up to the other half. Keeps the schedule predictable while
+        // smoothing correlated retries across many clients during a Horizon
+        // outage. Total sleep stays within SUBMIT_504_MAX_DELAY_MS.
+        const cappedDelay = Math.min(
+          SUBMIT_504_BASE_DELAY_MS * 2 ** attempt,
+          SUBMIT_504_MAX_DELAY_MS,
+        );
+        const half = cappedDelay / 2;
+        await sleep(half + Math.random() * half);
       }
-      throw e;
     }
+    throw lastError;
   }
 
   /**
@@ -211,6 +246,7 @@ export class Stellar {
           signerFunction,
           baseFee: newFee,
           memo,
+          maxFee,
         });
       }
       throw e;
